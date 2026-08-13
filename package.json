@@ -1,6 +1,6 @@
 {
   "name": "opencode-relay-pool",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "OpenCode plugin: dynamic model discovery for OpenAI-compatible relay/gateway endpoints + multi-key failover account pool with auto rotation, quarantine and weighted round-robin",
   "type": "module",
   "license": "MIT",

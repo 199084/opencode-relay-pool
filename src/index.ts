@@ -1,11 +1,18 @@
 import type { Plugin, PluginInput, PluginOptions as Options } from "@opencode-ai/plugin"
 import type { RelayProvider } from "./types.ts"
 import { KeyPool } from "./pool.ts"
-import { collectProviders } from "./config.ts"
+import { collectProviders, normalizeBaseURL } from "./config.ts"
 import { installFetchPatch, uninstallFetchPatch, registerProvider, isFetchPatched } from "./fetch-patch.ts"
 import { discoverForProvider } from "./discovery.ts"
 import { createTools } from "./tools.ts"
-import { PLUGIN_NAME, writeAuthKey, displayProviderName } from "./shared.ts"
+import {
+  PLUGIN_NAME,
+  writeAuthKey,
+  readAuth,
+  displayProviderName,
+  envFilePath,
+  readEnvFile,
+} from "./shared.ts"
 
 const DEBUG = Boolean(process.env.OPENCODE_RELAY_POOL_DEBUG)
 
@@ -25,10 +32,18 @@ function providerIDFromAlias(input: string, providers: Map<string, RelayProvider
   return undefined
 }
 
+function hydrateProcessEnv(fileEnv: Map<string, string>): void {
+  for (const [key, value] of fileEnv) {
+    if (process.env[key] === undefined) process.env[key] = value
+  }
+}
+
 export const server: Plugin = async (input: PluginInput, opts?: Options) => {
   const pool = new KeyPool()
   let providerMap = new Map<string, RelayProvider>()
-  let activePoolIDs = new Set<string>()
+  const userModels = new Map<string, Record<string, unknown>>()
+  const discoveredCounts = new Map<string, number>()
+  let liveConfig: Record<string, any> | null = null
 
   const toast = (message: string, variant: string, duration?: number): void => {
     try {
@@ -40,24 +55,49 @@ export const server: Plugin = async (input: PluginInput, opts?: Options) => {
     }
   }
 
+  const applyDiscoveredModels = (
+    providerID: string,
+    discovered: Record<string, Record<string, unknown>>,
+  ): void => {
+    discoveredCounts.set(providerID, Object.keys(discovered).length)
+    if (!liveConfig?.provider || typeof liveConfig.provider !== "object") return
+    const p = liveConfig.provider[providerID]
+    if (!p || typeof p !== "object") return
+    const preserved = userModels.get(providerID) ?? {}
+    p.models = { ...discovered, ...preserved }
+  }
+
   const registerIntoPool = (provider: RelayProvider): void => {
     if (provider.keys.length === 0) return
     pool.register(provider)
     registerProvider(provider.id, { header: provider.header, scheme: provider.scheme })
-    activePoolIDs.add(provider.id)
     try {
-      writeAuthKey(provider.id, pool.pick(provider.id))
+      const current = readAuth()[provider.id]?.key
+      if (!current || !provider.keys.includes(current)) {
+        writeAuthKey(provider.id, pool.pick(provider.id))
+      }
     } catch {
       // best-effort
     }
     trace(`registered ${provider.id}`, { keyCount: provider.keys.length })
   }
 
+  const upsertProvider = (provider: RelayProvider): void => {
+    const next: RelayProvider = {
+      ...provider,
+      baseURL: provider.baseURL ? normalizeBaseURL(provider.baseURL) : "",
+    }
+    providerMap.set(next.id, next)
+    registerIntoPool(next)
+  }
+
   const refreshModels = async (providerID: string): Promise<{ ok: boolean; count: number }> => {
     const provider = providerMap.get(providerID)
     if (!provider) return { ok: false, count: 0 }
-    const outcome = await discoverForProvider(provider, pool.has(providerID) ? pool : null)
+    if (!provider.baseURL) return { ok: false, count: 0 }
+    const outcome = await discoverForProvider(provider, pool.has(providerID) ? pool : null, { force: true })
     if (outcome.failed) return { ok: false, count: 0 }
+    applyDiscoveredModels(providerID, outcome.models)
     return { ok: true, count: Object.keys(outcome.models).length }
   }
 
@@ -67,20 +107,17 @@ export const server: Plugin = async (input: PluginInput, opts?: Options) => {
     },
 
     config: async (config: any) => {
-      const collected = collectProviders(config, opts)
+      liveConfig = config
+      const fileEnv = readEnvFile(envFilePath(input.directory))
+      hydrateProcessEnv(fileEnv)
+      const collected = collectProviders(config, opts, fileEnv)
       providerMap = new Map([...collected.providers, ...collected.external])
 
-      // register pools for configured providers
       for (const provider of collected.providers.values()) {
-        if (!activePoolIDs.has(provider.id)) {
-          registerIntoPool(provider)
-        }
+        registerIntoPool(provider)
       }
-      // external providers (env/auth keys) → failover only
       for (const provider of collected.external.values()) {
-        if (!activePoolIDs.has(provider.id)) {
-          registerIntoPool(provider)
-        }
+        registerIntoPool(provider)
       }
 
       if (!isFetchPatched()) {
@@ -97,6 +134,11 @@ export const server: Plugin = async (input: PluginInput, opts?: Options) => {
           const relayCfg = p.options?.relayPool ?? p.options?.modelsDiscovery
           if (relayCfg?.enabled === false) continue
 
+          if (!userModels.has(provider.id)) {
+            const existing = p.models && typeof p.models === "object" ? { ...p.models } : {}
+            userModels.set(provider.id, existing)
+          }
+
           discoveryJobs.push(
             (async () => {
               const outcome = await discoverForProvider(provider, pool.has(provider.id) ? pool : null)
@@ -105,10 +147,8 @@ export const server: Plugin = async (input: PluginInput, opts?: Options) => {
                 toast(`[${PLUGIN_NAME}] model discovery failed for ${displayProviderName(provider.id)}`, "error")
                 return
               }
-              const discovered = outcome.models
-              const existing = p.models && typeof p.models === "object" ? p.models : {}
-              p.models = { ...discovered, ...existing }
-              trace(`discovered ${Object.keys(discovered).length} models for ${provider.id}`)
+              applyDiscoveredModels(provider.id, outcome.models)
+              trace(`discovered ${Object.keys(outcome.models).length} models for ${provider.id}`)
             })(),
           )
         }
@@ -121,7 +161,9 @@ export const server: Plugin = async (input: PluginInput, opts?: Options) => {
       pool,
       resolveProvider: (name) => providerIDFromAlias(name, providerMap),
       providers: () => providerMap,
+      upsertProvider,
       refreshModels,
+      discoveredCount: (providerID) => discoveredCounts.get(providerID) ?? 0,
       toast,
     }),
   }

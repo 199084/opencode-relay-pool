@@ -20,13 +20,13 @@
 - **任意 OpenAI 兼容中转站**：只需 `baseURL` + 一个或多个 key，无需额外代码
 - **模型动态发现**：启动时拉取中转站 `/v1/models`，注入 OpenCode provider 配置 —— 中转站增删模型，`/models` 跟着变；并用 [models.dev](https://models.dev) 元数据自动补充新模型的上下文窗口与 reasoning 标记（24h 缓存，网络不通自动跳过）
 - **账号池 failover**：多 key 加权轮询；`429` 尊重 `Retry-After` 退避重试（长限流自动隔离、指数退避），`401/403/402` 永久禁用并切换，`5xx/过载` 退避后自动重试（最多 3 次）
-- **请求拦截轮换**：fetch 补丁自动识别池子 key，出错时透明切换下一个 key，并把激活 key 写入 `auth.json`；支持 `fetch(url, init)` 与 `fetch(new Request(...))` 两种调用形式
+- **请求拦截轮换**：fetch 补丁用请求头识别池子 key（不匹配则原样放行，不读取 Request body）；出错时透明切换下一个 key，并把激活 key 写入 `auth.json`；支持 `fetch(url, init)` 与 `fetch(new Request(...))` 两种调用形式
 - **流式零缓冲**：2xx 响应原样直通，不 clone 不缓冲 —— SSE 流式输出零延迟
 - **安全落盘**：`.env` / `auth.json` 写入即 `chmod 0600`，共享状态文件中的 key 已脱敏
 - **模型过滤**：正则 `includeRegex/excludeRegex`、字段级 `includeBy/excludeBy`、自动剔除 embedding 模型
 - **模型名称增强**：`smartModelName` 把 `owned_by` 拼进显示名（如 `openai gpt-5.2`）
 - **发现结果缓存**：可选（默认关闭），开启后默认 24h TTL
-- **可视化工具**：`relaypool-status` / `relaypool-setup` / `relaypool-remove` / `relaypool-reset` / `relaypool-refresh` / `relaypool-import`
+- **可视化工具**：`relaypool-status` / `relaypool-setup` / `relaypool-remove` / `relaypool-reset` / `relaypool-switch` / `relaypool-refresh` / `relaypool-import`；`relaypool-refresh` 会把新模型写回当前会话的 `/models` 列表
 - **配置兼容**：同时兼容 `relayPool`、`modelsDiscovery` 两种配置块，以及 `opencode-failover` 风格的 `*_API_KEYS` 环境变量和 `.env`
 
 ## 安装
@@ -99,6 +99,10 @@ key 会保存到项目 `.env`，插件自动注册账号池和模型发现。
 MYRELAY_API_KEYS="sk-xxx,sk-yyy,sk-zzz"
 MYRELAY_BASE_URL="https://relay.example.com/v1"
 ```
+
+`<ID>_API_KEYS` 与 `<ID>_BASE_URL` 会从进程环境变量和项目 `.env` 读取（`.env` 不覆盖已经存在的环境变量）。provider id 里的非字母数字会变成下划线，例如 `myrelay` → `MYRELAY_BASE_URL`。也可以只在 `opencode.json` 里写 `baseURL`，把 key 放在 `MYRELAY_API_KEYS` 里。
+
+若还要自动发现模型并出现在 `/models` 里，`opencode.json` 中仍需要对应的 `provider.<id>`（至少包含 `npm` 与 `options.baseURL`）。仅环境变量可以注册账号池，但不能凭空创建一个 OpenCode provider。
 
 ### 高级配置（可选）
 
@@ -183,7 +187,7 @@ MYRELAY_BASE_URL="https://relay.example.com/v1"
 | `relaypool-switch` | 手动切换当前激活 key（不传 key 轮换到下一个，传 key 指定） |
 | `relaypool-remove` | 移除 key（不传 `key` 参数则清空该 provider 全部 key） |
 | `relaypool-reset` | 把所有隔离/禁用的 key 重置为 active |
-| `relaypool-refresh` | 立即重新拉取某 provider 的模型列表 |
+| `relaypool-refresh` | 立即重新拉取某 provider 的模型列表，并写回当前会话的 `/models`（用户手写的 models 会保留，中转站已下线的模型会去掉） |
 | `relaypool-import` | 从 opencode `auth.json` 导入已有 key |
 
 ## 状态存储
@@ -199,21 +203,26 @@ MYRELAY_BASE_URL="https://relay.example.com/v1"
 | --- | --- |
 | `OPENCODE_RELAY_POOL_DEBUG` | 设为 `1` 输出调试日志 |
 | `OPENCODE_RELAY_POOL_ENV_FILE` | 自定义 `.env` 路径 |
+| `<ID>_API_KEYS` | 该 provider 的 key 列表，逗号分隔，如 `MYRELAY_API_KEYS` |
+| `<ID>_BASE_URL` | 该 provider 的中转站地址，如 `MYRELAY_BASE_URL` |
 | `OPENCODE_RELAY_POOL_KEYS` | keychain JSON（内部使用） |
 | `OPENCODE_RELAY_POOL_PROVIDERS` | provider 配置 JSON（内部使用） |
 
 ## 工作原理
 
 ```
-启动 → 解析 provider.relayPool / options.apiKeys 配置 → KeyPool 注册多 key
+启动 → 解析 provider.relayPool / options.apiKeys / <ID>_API_KEYS + <ID>_BASE_URL
+     → KeyPool 注册多 key（再次注册时保留隔离/禁用状态）
      → config hook: 请求 {baseURL}/v1/models → 过滤 → models.dev 补 limit/reasoning
-                   → 注入 config.provider.<id>.models
-     → fetch 补丁: 识别请求携带的池子 key 后进入轮换逻辑
+                   → 注入 config.provider.<id>.models（用户手写的 models 优先保留）
+     → fetch 补丁: 先用请求头匹配池子 key；不匹配则原样放行（不读 Request body）
+       ├─ 匹配成功后才物化 Request，以便出错重试
        ├─ 2xx → 原样直通（不 clone、不缓冲，SSE 流式输出零延迟）
        ├─ 401/403/402 → 禁用该 key, 切换下一个, 写入 auth.json（无需等待）
        ├─ 429/5xx/overload → 按 Retry-After（无则 2s）退避等待后重试
        │     Retry-After ≥ 10s → 隔离该 key（指数退避 60s→300s）并切换
        └─ 全部 key 不可用 → 降级用当前 key，请求绝不抛异常
+     relaypool-refresh → 强制重新发现并写回当前会话的 provider.models
      错误响应 body 仅读取前 2KB 用于分类，不影响原响应
      兼容 fetch(url, init) 与 fetch(new Request(...)) 两种调用形式
 ```
@@ -226,7 +235,7 @@ MYRELAY_BASE_URL="https://relay.example.com/v1"
 
 **模型列表不更新？**
 
-开启 `discovery.cache.enabled` 后默认缓存 24h；用 `relaypool-refresh` 可立即强制刷新，或直接重启 OpenCode。
+开启 `discovery.cache.enabled` 后默认缓存 24h；用 `relaypool-refresh` 会跳过缓存、重新拉取，并把结果写回当前会话的 `provider.<id>.models`（用户在配置里手写的模型会保留，中转站已下线的模型会去掉）。如果 TUI 的 `/models` 面板还显示旧列表，关掉再打开一次即可；仍没有则重启 OpenCode。
 
 **key 全部变成 DISABLED / QUAR？**
 

@@ -236,6 +236,7 @@ const MODELS_DEV_FAIL_COOLDOWN_MS = 5 * 60 * 1000
 let modelsDevLastFailAt = 0
 
 export async function fetchModelsDevData(): Promise<Map<string, unknown>> {
+  if (getEnv("OPENCODE_RELAY_POOL_SKIP_MODELS_DEV") === "1") return new Map()
   if (Date.now() - modelsDevLastFailAt < MODELS_DEV_FAIL_COOLDOWN_MS) return new Map()
   const cachePath = path.join(dataDir(), MODELS_DEV_CACHE_FILE)
   const cached = readJsonCache(cachePath, MODELS_DEV_TTL_MS)
@@ -276,6 +277,7 @@ function discoveryCachePath(providerID: string): string {
 export async function discoverForProvider(
   provider: RelayProvider,
   pool: KeyPool | null,
+  opts?: { force?: boolean },
 ): Promise<DiscoveryOutcome> {
   const cfg = provider.discovery
   if (cfg.enabled === false) return { provider, models: {} }
@@ -283,9 +285,10 @@ export async function discoverForProvider(
   const timeoutMs = cfg.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
   const cacheEnabled = cfg.cache?.enabled === true
   const ttlSeconds = cfg.cache?.ttlSeconds ?? 86400
+  const force = opts?.force === true
 
   const cachePath = discoveryCachePath(provider.id)
-  if (cacheEnabled) {
+  if (cacheEnabled && !force) {
     const cached = readJsonCache(cachePath, ttlSeconds * 1000)
     if (cached) {
       return { provider, models: cached as Record<string, Record<string, unknown>>, usingCache: true }

@@ -1,3 +1,5 @@
+process.env.OPENCODE_RELAY_POOL_SKIP_MODELS_DEV = "1"
+
 import { test, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
 import { createServer, type Server } from "node:http"
@@ -251,5 +253,213 @@ test("E2E: fetch patch matches pool key on fetch(new Request(...)) form", async 
   } finally {
     await hooks.dispose!()
     reqServer.close()
+  }
+})
+
+
+function toolCtx(directory = "/tmp/opencode/relay-pool-e2e") {
+  return {
+    sessionID: "s",
+    messageID: "m",
+    agent: "test",
+    directory,
+    worktree: directory,
+    abort: new AbortController().signal,
+    metadata() {},
+    ask: async () => {},
+  } as any
+}
+
+test("E2E: fetch patch does not consume Request body for non-pool requests", async () => {
+  const bodies: string[] = []
+  const bodyServer = createServer((req, res) => {
+    const chunks: Buffer[] = []
+    req.on("data", (c) => chunks.push(c))
+    req.on("end", () => {
+      bodies.push(Buffer.concat(chunks).toString("utf8"))
+      res.writeHead(200, { "Content-Type": "application/json" })
+      res.end("{}")
+    })
+  })
+  await new Promise<void>((resolve) => bodyServer.listen(0, "127.0.0.1", () => resolve()))
+  const port = (bodyServer.address() as { port: number }).port
+  const m = mockClient()
+  const hooks = await server(m.input)
+  try {
+    await hooks.config!({
+      provider: {
+        myrelay: {
+          npm: "@ai-sdk/openai-compatible",
+          options: {
+            baseURL: `http://127.0.0.1:${port}/v1`,
+            relayPool: { apiKeys: ["sk-pool-aaaaaaa", "sk-pool-bbbbbbb"], discovery: { enabled: false } },
+          },
+        },
+      },
+    })
+    const payload = JSON.stringify({ hello: "world", n: 42 })
+    const res = await fetch(
+      new Request(`http://127.0.0.1:${port}/unrelated`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: payload,
+      }),
+    )
+    assert.equal(res.status, 200)
+    assert.equal(bodies[0], payload)
+  } finally {
+    await hooks.dispose!()
+    bodyServer.close()
+  }
+})
+
+test("E2E: fetch patch still forwards Request body for pool-matched retries", async () => {
+  const bodies: string[] = []
+  const auths: (string | null)[] = []
+  const bodyServer = createServer((req, res) => {
+    const auth = req.headers.authorization ?? null
+    auths.push(auth)
+    const chunks: Buffer[] = []
+    req.on("data", (c) => chunks.push(c))
+    req.on("end", () => {
+      bodies.push(Buffer.concat(chunks).toString("utf8"))
+      if (auth?.includes("sk-bad")) {
+        res.writeHead(401, { "Content-Type": "application/json" })
+        res.end(JSON.stringify({ error: { message: "quota exceeded" } }))
+        return
+      }
+      res.writeHead(200, { "Content-Type": "application/json" })
+      res.end(JSON.stringify({ id: "chatcmpl", choices: [] }))
+    })
+  })
+  await new Promise<void>((resolve) => bodyServer.listen(0, "127.0.0.1", () => resolve()))
+  const port = (bodyServer.address() as { port: number }).port
+  const m = mockClient()
+  const hooks = await server(m.input)
+  try {
+    await hooks.config!({
+      provider: {
+        myrelay: {
+          npm: "@ai-sdk/openai-compatible",
+          options: {
+            baseURL: `http://127.0.0.1:${port}/v1`,
+            relayPool: { apiKeys: ["sk-bad", "sk-good"], discovery: { enabled: false } },
+          },
+        },
+      },
+    })
+    const payload = JSON.stringify({ model: "x", prompt: "keep-me" })
+    const started = Date.now()
+    const res = await fetch(
+      new Request(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { Authorization: "Bearer sk-bad", "Content-Type": "application/json" },
+        body: payload,
+      }),
+    )
+    const elapsed = Date.now() - started
+    assert.equal(res.status, 200)
+    assert.ok(auths.some((h) => h === "Bearer sk-good"))
+    assert.ok(bodies.some((b) => b.includes("keep-me")), "retried request must still carry the original body")
+    assert.ok(elapsed < 500, `401+quota should rotate immediately, took ${elapsed}ms`)
+  } finally {
+    await hooks.dispose!()
+    bodyServer.close()
+  }
+})
+
+test("E2E: 429 with retry-after-ms waits then retries the next key", async () => {
+  const auths: (string | null)[] = []
+  const limited = createServer((req, res) => {
+    const auth = req.headers.authorization ?? null
+    auths.push(auth)
+    if (auth?.includes("sk-slow")) {
+      res.writeHead(429, { "Content-Type": "application/json", "retry-after-ms": "80" })
+      res.end(JSON.stringify({ error: { message: "rate limit" } }))
+      return
+    }
+    res.writeHead(200, { "Content-Type": "application/json" })
+    res.end(JSON.stringify({ id: "chatcmpl", choices: [{ message: { content: "ok" } }] }))
+  })
+  await new Promise<void>((resolve) => limited.listen(0, "127.0.0.1", () => resolve()))
+  const port = (limited.address() as { port: number }).port
+  const m = mockClient()
+  const hooks = await server(m.input)
+  try {
+    await hooks.config!({
+      provider: {
+        myrelay: {
+          npm: "@ai-sdk/openai-compatible",
+          options: {
+            baseURL: `http://127.0.0.1:${port}/v1`,
+            relayPool: { apiKeys: ["sk-slow", "sk-good"], discovery: { enabled: false } },
+          },
+        },
+      },
+    })
+    const started = Date.now()
+    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: "Bearer sk-slow", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "x" }),
+    })
+    const elapsed = Date.now() - started
+    assert.equal(res.status, 200)
+    assert.ok(auths.some((h) => h === "Bearer sk-good"))
+    assert.ok(elapsed >= 70, `should honor retry-after-ms, took ${elapsed}ms`)
+    assert.ok(elapsed < 1500, `should not fall back to the 2s default, took ${elapsed}ms`)
+  } finally {
+    await hooks.dispose!()
+    limited.close()
+  }
+})
+
+test("E2E: relaypool-refresh writes newly discovered models back into live config", async () => {
+  let models = [{ id: "gpt-old", object: "model", owned_by: "openai" }]
+  const refreshServer = createServer((req, res) => {
+    if (req.url === "/v1/models") {
+      res.writeHead(200, { "Content-Type": "application/json" })
+      res.end(JSON.stringify({ object: "list", data: models }))
+      return
+    }
+    res.writeHead(404)
+    res.end("{}")
+  })
+  await new Promise<void>((resolve) => refreshServer.listen(0, "127.0.0.1", () => resolve()))
+  const port = (refreshServer.address() as { port: number }).port
+  const m = mockClient()
+  const hooks = await server(m.input)
+  try {
+    const config: any = {
+      provider: {
+        myrelay: {
+          npm: "@ai-sdk/openai-compatible",
+          name: "My Relay",
+          models: { "user-pinned": { id: "user-pinned", name: "pinned" } },
+          options: {
+            baseURL: `http://127.0.0.1:${port}/v1`,
+            relayPool: { apiKeys: ["sk-test"], discovery: { enabled: true, timeoutMs: 3000 } },
+          },
+        },
+      },
+    }
+    await hooks.config!(config)
+    assert.ok(config.provider.myrelay.models["gpt-old"])
+    assert.ok(config.provider.myrelay.models["user-pinned"], "user-specified models must be preserved")
+
+    models = [
+      { id: "gpt-new", object: "model", owned_by: "openai" },
+      { id: "deepseek-chat", object: "model", owned_by: "deepseek" },
+    ]
+    const result = await hooks.tool!["relaypool-refresh"].execute({ provider: "myrelay" }, toolCtx())
+    assert.equal(typeof result, "string")
+    assert.match(String(result), /2 models written to live config/)
+    assert.ok(config.provider.myrelay.models["gpt-new"], "refresh must inject newly discovered models")
+    assert.ok(config.provider.myrelay.models["deepseek-chat"])
+    assert.equal(config.provider.myrelay.models["gpt-old"], undefined, "models removed on the relay must drop")
+    assert.ok(config.provider.myrelay.models["user-pinned"], "user-specified models must survive refresh")
+  } finally {
+    await hooks.dispose!()
+    refreshServer.close()
   }
 })

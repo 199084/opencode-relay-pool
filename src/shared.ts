@@ -8,6 +8,11 @@ export const PLUGIN_NAME = "opencode-relay-pool"
 export const KEYCHAIN_JSON_KEY = "OPENCODE_RELAY_POOL_KEYS"
 export const PROVIDERS_ENV_KEY = "OPENCODE_RELAY_POOL_PROVIDERS"
 export const ENV_KEYS_SUFFIX = "_API_KEYS"
+export const ENV_BASE_URL_SUFFIX = "_BASE_URL"
+
+export function envNameForProvider(providerID: string, suffix: string): string {
+  return `${providerID.replace(/[^a-zA-Z0-9]/g, "_").toUpperCase()}${suffix}`
+}
 
 export function configDir(): string {
   const custom = process.env.OPENCODE_CONFIG_DIR

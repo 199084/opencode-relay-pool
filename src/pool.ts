@@ -33,21 +33,28 @@ export class KeyPool {
   }
 
   register(provider: RelayProvider): void {
-    const now = Date.now()
+    const previous = this.pools.get(provider.id) ?? []
+    const previousByKey = new Map(previous.map((entry) => [entry.key, entry]))
     this.pools.set(
       provider.id,
-      provider.keys.map((key) => ({
-        key,
-        weight: provider.weight[key] ?? 1,
-        status: "active" as const,
-        quarantinedUntil: 0,
-        consecutiveErrors: 0,
-        lastErrorAt: 0,
-        lastErrorMessage: "",
-        retryAfterMs: null,
-      })),
+      provider.keys.map((key) => {
+        const existing = previousByKey.get(key)
+        if (existing) {
+          return { ...existing, weight: provider.weight[key] ?? existing.weight }
+        }
+        return {
+          key,
+          weight: provider.weight[key] ?? 1,
+          status: "active" as const,
+          quarantinedUntil: 0,
+          consecutiveErrors: 0,
+          lastErrorAt: 0,
+          lastErrorMessage: "",
+          retryAfterMs: null,
+        }
+      }),
     )
-    this.indexes.set(provider.id, 0)
+    if (!this.indexes.has(provider.id)) this.indexes.set(provider.id, 0)
     this.serialize()
   }
 
@@ -87,7 +94,11 @@ export class KeyPool {
     }
     const slots: string[] = []
     for (const k of active) {
-      for (let w = 0; w < k.weight; w++) slots.push(k.key)
+      const copies = Number.isFinite(k.weight) && k.weight > 0 ? Math.floor(k.weight) : 1
+      for (let w = 0; w < copies; w++) slots.push(k.key)
+    }
+    if (slots.length === 0) {
+      throw new Error(`No active keys available for provider "${providerID}"`)
     }
     const idx = (this.indexes.get(providerID)! + 1) % slots.length
     this.indexes.set(providerID, idx)

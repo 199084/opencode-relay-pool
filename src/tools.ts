@@ -4,6 +4,7 @@ import type { RelayProvider } from "./types.ts"
 import {
   KEYCHAIN_JSON_KEY,
   ENV_KEYS_SUFFIX,
+  ENV_BASE_URL_SUFFIX,
   envFilePath,
   readEnvFile,
   writeEnvKey,
@@ -13,20 +14,23 @@ import {
   maskKey,
   displayProviderName,
   importFromAuthJson,
+  envNameForProvider,
 } from "./shared.ts"
-import { readKeychainJson, writeKeychainJson } from "./config.ts"
+import { readKeychainJson, writeKeychainJson, normalizeBaseURL } from "./config.ts"
 
 export interface ToolContext {
   directory: string
   pool: KeyPool
   resolveProvider: (input: string) => string | undefined
   providers: () => Map<string, RelayProvider>
+  upsertProvider: (provider: RelayProvider) => void
   refreshModels: (providerID: string) => Promise<{ ok: boolean; count: number }>
+  discoveredCount: (providerID: string) => number
   toast: (message: string, variant: string, duration?: number) => void
 }
 
 function authEnvKey(providerID: string): string {
-  return `${providerID.replace(/[^a-zA-Z0-9]/g, "_").toUpperCase()}${ENV_KEYS_SUFFIX}`
+  return envNameForProvider(providerID, ENV_KEYS_SUFFIX)
 }
 
 function allKeysFor(ctx: ToolContext, providerID: string): string[] {
@@ -40,11 +44,24 @@ function allKeysFor(ctx: ToolContext, providerID: string): string[] {
   return []
 }
 
-function rehydratePool(ctx: ToolContext, providerID: string, keys: string[]): void {
-  const provider = ctx.providers().get(providerID)
-  if (!provider) return
-  const updated: RelayProvider = { ...provider, keys }
-  ctx.pool.register(updated)
+function rehydratePool(ctx: ToolContext, providerID: string, keys: string[], baseURL?: string): void {
+  const existing = ctx.providers().get(providerID)
+  const normalizedBase =
+    baseURL && baseURL.trim().length > 0 ? normalizeBaseURL(baseURL.trim()) : existing?.baseURL ?? ""
+  if (existing) {
+    ctx.upsertProvider({ ...existing, keys, baseURL: normalizedBase })
+    return
+  }
+  ctx.upsertProvider({
+    id: providerID,
+    name: providerID,
+    baseURL: normalizedBase,
+    keys,
+    weight: {},
+    header: "Authorization",
+    scheme: "Bearer",
+    discovery: {},
+  })
 }
 
 export function createTools(ctx: ToolContext) {
@@ -80,7 +97,9 @@ export function createTools(ctx: ToolContext) {
           const active = keys.filter((k) => k.status === "active").length
           const quarantined = keys.filter((k) => k.status === "quarantined").length
           const disabled = keys.filter((k) => k.status === "disabled").length
+          const modelCount = ctx.discoveredCount(providerID)
           lines.push(`  ### Summary: ${active} active, ${quarantined} quarantined, ${disabled} disabled`)
+          if (modelCount > 0) lines.push(`  ### Models: ${modelCount} discovered`)
           if (discovered?.enabled === false) lines.push("  ### Model discovery: disabled")
           lines.push("")
         }
@@ -116,10 +135,10 @@ export function createTools(ctx: ToolContext) {
         process.env[KEYCHAIN_JSON_KEY] = JSON.stringify(Object.fromEntries(json))
 
         if (base_url && base_url.trim().length > 0) {
-          await writeEnvKey(envPath, `${authEnvKey(resolved).slice(0, -ENV_KEYS_SUFFIX.length)}_BASE_URL`, base_url.trim())
+          await writeEnvKey(envPath, envNameForProvider(resolved, ENV_BASE_URL_SUFFIX), base_url.trim())
         }
 
-        rehydratePool(ctx, resolved, merged)
+        rehydratePool(ctx, resolved, merged, base_url)
         if (merged.length > 0) {
           try {
             writeAuthKey(resolved, merged[0])
@@ -233,7 +252,7 @@ export function createTools(ctx: ToolContext) {
 
     "relaypool-refresh": tool({
       description:
-        "opencode-relay-pool: Manually trigger model discovery for a relay provider, refreshing the /models list immediately.",
+        "opencode-relay-pool: Manually trigger model discovery for a relay provider and write the result back into the live /models list for this session.",
       args: {
         provider: tool.schema.string().optional().describe("Provider/relay id. Omit to refresh all configured providers."),
       },
@@ -249,7 +268,7 @@ export function createTools(ctx: ToolContext) {
             continue
           }
           const r = await ctx.refreshModels(id)
-          results.push(`${id}: ${r.ok ? `${r.count} models` : "discovery failed"}`)
+          results.push(`${id}: ${r.ok ? `${r.count} models written to live config` : "discovery failed"}`)
         }
         return `relaypool-refresh:\n${results.join("\n")}`
       },

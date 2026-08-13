@@ -142,9 +142,17 @@ export function installFetchPatch(
   globalThis.fetch = (async (req: FetchArgs[0], init?: FetchArgs[1]) => {
     if (!_original || !_pool) return _original!(req, init)
 
+    // Match against pool keys using headers only — never consume a Request
+    // body until we know this call belongs to a relay pool (unrelated
+    // fetch(new Request(...)) traffic must pass through untouched).
+    const hdrs = readHeaders(req, init)
+    const authValue = findAuthValue(hdrs)
+    const match = matchPoolKey(authValue)
+    if (!match) return _original(req, init)
+
     // Materialize Request input into url+init so retries can rebuild it
     // (a Request body stream is single-use and cannot be re-passed to fetch).
-    let reqUrl = req
+    let reqUrl: FetchArgs[0] = req
     let reqInit = init
     if (req instanceof Request) {
       const body = req.method === "GET" || req.method === "HEAD" ? undefined : await req.arrayBuffer()
@@ -159,11 +167,6 @@ export function installFetchPatch(
         keepalive: req.keepalive,
       }
     }
-
-    const hdrs = readHeaders(reqUrl, reqInit)
-    const authValue = findAuthValue(hdrs)
-    const match = matchPoolKey(authValue)
-    if (!match) return _original(reqUrl, reqInit)
 
     const { providerID, key: currentKey, meta } = match
     let key = safePick(providerID, currentKey)
@@ -243,7 +246,7 @@ export function installFetchPatch(
       key = next
     }
 
-    throw new Error("opencode-relay-pool: retry loop exhausted")
+    return _original(reqUrl, reqInit)
   }) as typeof fetch
 }
 

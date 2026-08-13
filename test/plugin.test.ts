@@ -1,3 +1,5 @@
+process.env.OPENCODE_RELAY_POOL_SKIP_MODELS_DEV = "1"
+
 import { test, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
 import { createServer, type Server } from "node:http"
@@ -233,4 +235,111 @@ test("discovery: enabled:false skips model fetching entirely", async () => {
   } finally {
     server.close()
   }
+})
+
+
+test("classify: 401/402/403 disable even when body mentions quota or capacity", () => {
+  assert.equal(
+    classify({ statusCode: 401, responseBody: '{"error":"quota exceeded"}' }).action,
+    ErrorAction.Disable,
+  )
+  assert.equal(
+    classify({ statusCode: 403, responseBody: "capacity exhausted, try another key" }).action,
+    ErrorAction.Disable,
+  )
+  assert.equal(
+    classify({ statusCode: 402, responseBody: "quota exceeded" }).action,
+    ErrorAction.Disable,
+  )
+  assert.equal(classify({ statusCode: 200, responseBody: "quota exceeded" }).action, ErrorAction.Ignore)
+})
+
+test("classify: Retry-After header is parsed case-insensitively", () => {
+  const seconds = classify({ statusCode: 429, responseHeaders: { "Retry-After": "5" } })
+  assert.equal(seconds.action, ErrorAction.Rotate)
+  assert.equal(seconds.retryAfterMs, 5000)
+  const millis = classify({ statusCode: 429, responseHeaders: { "retry-after-ms": "80" } })
+  assert.equal(millis.retryAfterMs, 80)
+})
+
+test("classify: Retry-After parsed from response body", () => {
+  const result = classify({ statusCode: 429, responseBody: "rate limited, try again in 2m 30s" })
+  assert.equal(result.action, ErrorAction.Rotate)
+  assert.equal(result.retryAfterMs, 150_000)
+})
+
+test("KeyPool: re-register preserves quarantine and adds new keys", () => {
+  const pool = new KeyPool()
+  pool.register(providerWithKeys("http://x", ["sk-a", "sk-b"]))
+  pool.quarantine("mockrelay", "sk-a", 60_000, "429")
+  pool.register({
+    ...providerWithKeys("http://x", ["sk-a", "sk-b", "sk-c"]),
+    weight: {},
+  })
+  const status = pool.status("mockrelay")
+  assert.equal(status.find((k) => k.key === "sk-a")?.status, "quarantined")
+  assert.equal(status.find((k) => k.key === "sk-c")?.status, "active")
+  assert.notEqual(pool.pick("mockrelay"), "sk-a")
+})
+
+test("KeyPool: zero weight does not crash pick()", () => {
+  const pool = new KeyPool()
+  pool.register({
+    ...providerWithKeys("http://x", ["sk-a"]),
+    weight: { "sk-a": 0 },
+  })
+  assert.equal(pool.pick("mockrelay"), "sk-a")
+})
+
+test("collectProviders: *_API_KEYS and *_BASE_URL from env enable a relay", () => {
+  const prevKeys = process.env.MYRELAY_API_KEYS
+  const prevBase = process.env.MYRELAY_BASE_URL
+  process.env.MYRELAY_API_KEYS = "sk-env-1,sk-env-2"
+  process.env.MYRELAY_BASE_URL = "https://relay.example.com/v1"
+  try {
+    const { external, providers } = collectProviders({}, {})
+    assert.equal(providers.size, 0)
+    assert.ok(external.has("myrelay"))
+    const p = external.get("myrelay")!
+    assert.equal(p.baseURL, "https://relay.example.com")
+    assert.deepEqual(p.keys, ["sk-env-1", "sk-env-2"])
+  } finally {
+    if (prevKeys === undefined) delete process.env.MYRELAY_API_KEYS
+    else process.env.MYRELAY_API_KEYS = prevKeys
+    if (prevBase === undefined) delete process.env.MYRELAY_BASE_URL
+    else process.env.MYRELAY_BASE_URL = prevBase
+  }
+})
+
+test("collectProviders: config baseURL plus env keys (no relayPool block)", () => {
+  const prev = process.env.SIMPLE_API_KEYS
+  process.env.SIMPLE_API_KEYS = "sk-from-env"
+  try {
+    const config = {
+      provider: {
+        simple: {
+          npm: "@ai-sdk/openai-compatible",
+          options: { baseURL: "https://relay.example.com/v1" },
+        },
+      },
+    }
+    const { providers } = collectProviders(config, {})
+    assert.ok(providers.has("simple"))
+    assert.deepEqual(providers.get("simple")!.keys, ["sk-from-env"])
+    assert.equal(providers.get("simple")!.baseURL, "https://relay.example.com")
+  } finally {
+    if (prev === undefined) delete process.env.SIMPLE_API_KEYS
+    else process.env.SIMPLE_API_KEYS = prev
+  }
+})
+
+test("collectProviders: extraEnv map supplies keys without mutating process.env", () => {
+  const extra = new Map([
+    ["FILE_RELAY_API_KEYS", "sk-file-1"],
+    ["FILE_RELAY_BASE_URL", "https://from-file.example.com/v1"],
+  ])
+  const { external } = collectProviders({}, {}, extra)
+  assert.ok(external.has("file_relay"))
+  assert.equal(external.get("file_relay")!.baseURL, "https://from-file.example.com")
+  assert.deepEqual(external.get("file_relay")!.keys, ["sk-file-1"])
 })

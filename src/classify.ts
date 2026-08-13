@@ -24,7 +24,12 @@ interface APIError {
 export function classify(raw: unknown): ClassifierResult {
   const error = (raw as Record<string, unknown>).data ?? raw
   const status = Number((error as APIError).statusCode ?? (error as Record<string, unknown>).status ?? 0)
-  const headers = (error as APIError).responseHeaders ?? (error as Record<string, unknown>).headers ?? {}
+  const headers = lowerHeaders(
+    ((error as APIError).responseHeaders ?? (error as Record<string, unknown>).headers ?? {}) as Record<
+      string,
+      string | null | undefined
+    >,
+  )
   const body = String((error as APIError).responseBody ?? (error as Record<string, unknown>).body ?? "")
   const message = String((error as APIError).message ?? (error as Record<string, unknown>).message ?? "")
   const isRetryable = Boolean((error as APIError).isRetryable ?? (error as Record<string, unknown>).isRetryable ?? false)
@@ -69,6 +74,14 @@ export function classify(raw: unknown): ClassifierResult {
   }
 
   return { action: ErrorAction.Ignore, retryAfterMs: null, reason: "Non-retryable error" }
+}
+
+function lowerHeaders(headers: Record<string, string | null | undefined>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof value === "string") out[key.toLowerCase()] = value
+  }
+  return out
 }
 
 function parseRetryAfter(headers: Record<string, string>): number | null {
