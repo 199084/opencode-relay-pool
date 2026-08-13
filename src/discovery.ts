@@ -271,6 +271,7 @@ export async function discoverForProvider(
   pool: KeyPool | null,
 ): Promise<DiscoveryOutcome> {
   const cfg = provider.discovery
+  if (cfg.enabled === false) return { provider, models: {} }
   const endpoint = cfg.endpoint ?? DEFAULT_MODELS_ENDPOINT
   const timeoutMs = cfg.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
   const cacheEnabled = cfg.cache?.enabled === true

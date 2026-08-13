@@ -21,16 +21,6 @@ function normalizeBaseURL(baseURL: string): string {
   return normalized
 }
 
-export function isOpenAICompatibleProvider(provider: any): boolean {
-  return (
-    provider !== null &&
-    typeof provider === "object" &&
-    (provider.npm === "@ai-sdk/openai-compatible" ||
-      provider.npm === "openai" ||
-      /\/v1(\/|$)/.test(provider.options?.baseURL ?? ""))
-  )
-}
-
 export function readKeychainJson(env: Map<string, string>): Map<string, string[]> {
   const result = new Map<string, string[]>()
   const raw = env.get(KEYCHAIN_JSON_KEY)

@@ -219,3 +219,18 @@ test("discovery: includeRegex filter", async () => {
     server.close()
   }
 })
+
+test("discovery: enabled:false skips model fetching entirely", async () => {
+  const { port } = await mockRelay()
+  try {
+    const provider: RelayProvider = {
+      ...providerWithKeys(`http://127.0.0.1:${port}`, ["sk-test"]),
+      discovery: { enabled: false },
+    }
+    const outcome = await discoverForProvider(provider, null)
+    assert.deepEqual(Object.keys(outcome.models), [])
+    assert.equal(provider.discovery.enabled, false)
+  } finally {
+    server.close()
+  }
+})

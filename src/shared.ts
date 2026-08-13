@@ -127,6 +127,11 @@ export function writeAuthKey(providerID: string, key: string, metadata?: Record<
   }
   all[providerID] = entry
   writeFileSync(p, JSON.stringify(all, null, 2), "utf-8")
+  try {
+    chmodSync(p, 0o600)
+  } catch {
+    // ignore
+  }
 }
 
 export function removeAuthKey(providerID: string): void {
@@ -135,6 +140,11 @@ export function removeAuthKey(providerID: string): void {
   delete all[providerID]
   const p = authFilePath()
   writeFileSync(p, JSON.stringify(all, null, 2), "utf-8")
+  try {
+    chmodSync(p, 0o600)
+  } catch {
+    // ignore
+  }
 }
 
 export function importFromAuthJson(): Map<string, { keys: string[]; metadata?: Record<string, string> }> {
@@ -219,6 +229,11 @@ export async function writeEnvKey(filePath: string, key: string, value: string):
   if (!replaced) lines.push(`${key}=${value}`)
   const { writeFile } = await import("node:fs/promises")
   await writeFile(filePath, lines.join("\n") + "\n", "utf-8")
+  try {
+    chmodSync(filePath, 0o600)
+  } catch {
+    // ignore
+  }
 }
 
 export async function removeEnvKey(filePath: string, key: string): Promise<boolean> {

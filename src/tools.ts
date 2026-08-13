@@ -240,7 +240,8 @@ export function createTools(ctx: ToolContext) {
       async execute({ provider }: { provider?: string }) {
         const ids = provider
           ? [ctx.resolveProvider(provider) ?? provider]
-          : ctx.providers().keys() ? Array.from(ctx.providers().keys()) : ctx.pool.allProviderIDs()
+          : Array.from(ctx.providers().keys())
+        if (ids.length === 0) return "relaypool-refresh: No relay providers configured."
         const results: string[] = []
         for (const id of ids) {
           if (!ctx.providers().has(id)) {

@@ -95,7 +95,6 @@ function detectOverloadPattern(body: string, message: string): string | null {
   const lower = body.toLowerCase() + message.toLowerCase()
   const patterns = [
     "resource exhausted",
-    "resourcexhausted",
     "resource_exhausted",
     "res_exhausted",
     "res exhausted",

@@ -158,3 +158,98 @@ test("E2E: fetch patch rotates bad key on 401 and 429", async () => {
     failoverServer.close()
   }
 })
+
+test("E2E: fetch patch does not buffer streaming 2xx bodies", async () => {
+  const streamServer = createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" })
+    res.write('data: {"choices":[{"delta":{"content":"first chunk"}}]}\n\n')
+    setTimeout(() => {
+      res.write('data: {"choices":[{"delta":{"content":"second chunk"}}]}\n\n')
+      res.end()
+    }, 500)
+  })
+  await new Promise<void>((resolve) => streamServer.listen(0, "127.0.0.1", () => resolve()))
+  const port = (streamServer.address() as { port: number }).port
+  const m = mockClient()
+  const hooks = await server(m.input)
+  try {
+    const config: any = {
+      provider: {
+        myrelay: {
+          npm: "@ai-sdk/openai-compatible",
+          name: "My Relay",
+          options: {
+            baseURL: `http://127.0.0.1:${port}/v1`,
+            relayPool: { apiKeys: ["sk-good"], discovery: { enabled: false } },
+          },
+        },
+      },
+    }
+    await hooks.config!(config)
+
+    const started = Date.now()
+    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: "Bearer sk-good", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "x" }),
+    })
+    const elapsed = Date.now() - started
+    assert.equal(res.status, 200)
+    const reader = res.body!.getReader()
+    const first = await reader.read()
+    const text = Buffer.from(first.value ?? new Uint8Array()).toString("utf8")
+    assert.ok(text.includes("first chunk"), "first chunk should arrive immediately")
+    assert.ok(elapsed < 300, `should not wait for full body, took ${elapsed}ms`)
+    await reader.cancel().catch(() => {})
+  } finally {
+    await hooks.dispose!()
+    streamServer.close()
+  }
+})
+
+test("E2E: fetch patch matches pool key on fetch(new Request(...)) form", async () => {
+  const auths: (string | null)[] = []
+  const reqServer = createServer((req, res) => {
+    const auth = req.headers.authorization ?? null
+    auths.push(auth)
+    if (auth?.includes("sk-bad")) {
+      res.writeHead(401, { "Content-Type": "application/json" })
+      res.end(JSON.stringify({ error: { message: "auth failed" } }))
+      return
+    }
+    res.writeHead(200, { "Content-Type": "application/json" })
+    res.end(JSON.stringify({ id: "chatcmpl", choices: [] }))
+  })
+  await new Promise<void>((resolve) => reqServer.listen(0, "127.0.0.1", () => resolve()))
+  const port = (reqServer.address() as { port: number }).port
+  const m = mockClient()
+  const hooks = await server(m.input)
+  try {
+    const config: any = {
+      provider: {
+        myrelay: {
+          npm: "@ai-sdk/openai-compatible",
+          name: "My Relay",
+          options: {
+            baseURL: `http://127.0.0.1:${port}/v1`,
+            relayPool: { apiKeys: ["sk-bad", "sk-good"], discovery: { enabled: false } },
+          },
+        },
+      },
+    }
+    await hooks.config!(config)
+
+    const res = await fetch(
+      new Request(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { Authorization: "Bearer sk-bad", "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "x" }),
+      }),
+    )
+    assert.equal(res.status, 200)
+    assert.ok(auths.some((h) => h === "Bearer sk-good"), "should have retried with sk-good")
+  } finally {
+    await hooks.dispose!()
+    reqServer.close()
+  }
+})

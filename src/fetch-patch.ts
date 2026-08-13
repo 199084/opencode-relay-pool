@@ -2,8 +2,8 @@ import type { KeyPool } from "./pool.ts"
 import { classify, ErrorAction } from "./classify.ts"
 import { maskKey, writeAuthKey } from "./shared.ts"
 
-const RETRYABLE = new Set([429, 500, 502, 503, 504, 529])
 const MAX_RETRIES = 3
+const MAX_BODY_PREVIEW = 2048
 const AUTH_HEADERS = ["authorization", "x-api-key", "api-key", "x-goog-api-key"]
 
 export interface ProviderMeta {
@@ -20,18 +20,43 @@ let _installed = false
 
 type FetchArgs = Parameters<typeof fetch>
 
-function retryMs(headers: Headers): number {
-  const raw = headers.get("retry-after")
-  if (!raw) return 60_000
-  const n = Number(raw)
-  if (Number.isFinite(n)) return Math.max(1000, n * 1000)
-  const d = Date.parse(raw)
-  if (Number.isFinite(d)) return Math.max(1000, d - Date.now())
-  return 60_000
+/** Read only the first MAX_BODY_PREVIEW bytes of a response body, then cancel the stream. */
+async function readBodyPreview(res: Response): Promise<string> {
+  if (!res.body) return ""
+  try {
+    const reader = res.clone().body!.getReader()
+    let total = 0
+    const chunks: string[] = []
+    while (total < MAX_BODY_PREVIEW) {
+      const { done, value } = await reader.read()
+      if (done) break
+      const text = Buffer.from(value).toString("utf8")
+      chunks.push(text)
+      total += text.length
+    }
+    await reader.cancel().catch(() => {})
+    return chunks.join("")
+  } catch {
+    return ""
+  }
 }
 
-function readHeaders(init?: RequestInit): Record<string, string> {
+/** Pick the next pool key; if every key is disabled/quarantined, keep using the current key. */
+function safePick(providerID: string, fallbackKey: string): string {
+  try {
+    return _pool!.pick(providerID)
+  } catch {
+    return fallbackKey
+  }
+}
+
+function readHeaders(req: FetchArgs[0], init?: RequestInit): Record<string, string> {
   const result: Record<string, string> = {}
+  if (req instanceof Request) {
+    req.headers.forEach((v, k) => {
+      result[k.toLowerCase()] = v
+    })
+  }
   if (!init?.headers) return result
   if (init.headers instanceof Headers) {
     init.headers.forEach((v, k) => {
@@ -117,102 +142,68 @@ export function installFetchPatch(
   globalThis.fetch = (async (req: FetchArgs[0], init?: FetchArgs[1]) => {
     if (!_original || !_pool) return _original!(req, init)
 
-    const hdrs = readHeaders(init)
+    // Materialize Request input into url+init so retries can rebuild it
+    // (a Request body stream is single-use and cannot be re-passed to fetch).
+    let reqUrl = req
+    let reqInit = init
+    if (req instanceof Request) {
+      const body = req.method === "GET" || req.method === "HEAD" ? undefined : await req.arrayBuffer()
+      reqUrl = req.url
+      reqInit = {
+        method: req.method,
+        headers: req.headers,
+        body,
+        signal: req.signal,
+        redirect: req.redirect,
+        integrity: req.integrity,
+        keepalive: req.keepalive,
+      }
+    }
+
+    const hdrs = readHeaders(reqUrl, reqInit)
     const authValue = findAuthValue(hdrs)
     const match = matchPoolKey(authValue)
-    if (!match) return _original(req, init)
+    if (!match) return _original(reqUrl, reqInit)
 
-    const { providerID, meta } = match
-    let key = _pool.pick(providerID)
+    const { providerID, key: currentKey, meta } = match
+    let key = safePick(providerID, currentKey)
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      const newInit = applyAuth(init, meta, key)
-      const res = await _original(req, newInit)
+      const newInit = applyAuth(reqInit, meta, key)
+      const res = await _original(reqUrl, newInit)
 
-      if (!RETRYABLE.has(res.status)) {
-        let body = ""
-        try {
-          body = await res.clone().text()
-        } catch {
-          // ignore
-        }
-        const result = classify({ statusCode: res.status, responseBody: body, message: body.slice(0, 200) })
-        if (result.action !== ErrorAction.Overload) return res
-        if (attempt >= MAX_RETRIES - 1) return res
+      // success — return immediately, never buffer streaming bodies
+      if (res.status >= 200 && res.status < 300) return res
 
-        const next = _pool.pick(providerID)
-        try {
-          writeAuthKey(providerID, next)
-        } catch {
-          // ignore
-        }
-        _toast?.(
-          `${maskKey(next)} — server overload, switched.`,
-          "warning",
-        )
-        key = next
-        continue
-      }
+      const preview = await readBodyPreview(res)
+      const result = classify({
+        statusCode: res.status,
+        responseHeaders: Object.fromEntries(res.headers.entries()),
+        responseBody: preview,
+        message: preview.slice(0, 200),
+      })
+      if (result.action === ErrorAction.Ignore) return res
       if (attempt >= MAX_RETRIES - 1) return res
 
-      let body = ""
-      try {
-        body = await res.clone().text()
-      } catch {
-        // ignore
-      }
-
-      const error = { statusCode: res.status, responseBody: body, message: body.slice(0, 200) }
-      const result = classify(error)
-      if (result.action === ErrorAction.Ignore) return res
-
       const masked = maskKey(key)
-
-      if (result.action === ErrorAction.Overload) {
-        const next = _pool.pick(providerID)
-        try {
-          writeAuthKey(providerID, next)
-        } catch {
-          // ignore
-        }
-        _toast?.(
-          `[${providerID}] overload → ${maskKey(next)}`,
-          "warning",
-        )
-        key = next
-        continue
-      }
+      const next = safePick(providerID, key)
+      if (next === key) continue
 
       if (result.action === ErrorAction.Disable) {
         _pool.disable(providerID, key, result.reason)
-        key = _pool.pick(providerID)
         try {
-          writeAuthKey(providerID, key)
+          writeAuthKey(providerID, next)
         } catch {
           // ignore
         }
         _toast?.(`${providerID} key ${masked} disabled — ${result.reason}`, "error")
+        key = next
         continue
       }
 
-      if (result.action === ErrorAction.Rotate) {
-        const delay = result.retryAfterMs || retryMs(res.headers)
-        if (delay < 10_000) {
-          const next = _pool.pick(providerID)
-          try {
-            writeAuthKey(providerID, next)
-          } catch {
-            // ignore
-          }
-          _toast?.(
-            `[${providerID}] → ${maskKey(next)} (${Math.ceil(delay / 1000)}s)`,
-            "warning",
-          )
-          key = next
-          continue
-        }
+      const delay = result.retryAfterMs ?? 2000
+      if (delay >= 10_000) {
         _pool.quarantine(providerID, key, delay, result.reason)
-        const next = _pool.pick(providerID)
         try {
           writeAuthKey(providerID, next)
         } catch {
@@ -225,6 +216,17 @@ export function installFetchPatch(
         key = next
         continue
       }
+
+      try {
+        writeAuthKey(providerID, next)
+      } catch {
+        // ignore
+      }
+      _toast?.(
+        `[${providerID}] → ${maskKey(next)} (${Math.ceil(delay / 1000)}s)`,
+        "warning",
+      )
+      key = next
     }
 
     throw new Error("opencode-relay-pool: retry loop exhausted")

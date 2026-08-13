@@ -23,7 +23,7 @@
 - **请求拦截轮换**：fetch 补丁自动识别池子 key，出错时透明切换下一个 key，并把激活 key 写入 `auth.json`
 - **模型过滤**：正则 `includeRegex/excludeRegex`、字段级 `includeBy/excludeBy`、自动剔除 embedding 模型
 - **模型名称增强**：`smartModelName` 把 `owned_by` 拼进显示名（如 `openai gpt-5.2`）
-- **发现结果缓存**：可选缓存，默认 24h TTL
+- **发现结果缓存**：可选（默认关闭），开启后默认 24h TTL
 - **可视化工具**：`relaypool-status` / `relaypool-setup` / `relaypool-remove` / `relaypool-reset` / `relaypool-refresh` / `relaypool-import`
 - **配置兼容**：同时兼容 `relayPool`、`modelsDiscovery` 两种配置块，以及 `opencode-failover` 风格的 `*_API_KEYS` 环境变量和 `.env`
 
