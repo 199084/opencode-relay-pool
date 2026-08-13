@@ -18,8 +18,8 @@
 ## 特性
 
 - **任意 OpenAI 兼容中转站**：只需 `baseURL` + 一个或多个 key，无需额外代码
-- **模型动态发现**：启动时拉取中转站 `/v1/models`，注入 OpenCode provider 配置 —— 中转站增删模型，`/models` 跟着变
-- **账号池 failover**：多 key 加权轮询；`429` 按 `Retry-After` 隔离（指数退避），`401/403/402` 永久禁用并切换，`5xx` 自动重试
+- **模型动态发现**：启动时拉取中转站 `/v1/models`，注入 OpenCode provider 配置 —— 中转站增删模型，`/models` 跟着变；并用 [models.dev](https://models.dev) 元数据自动补充新模型的上下文窗口与 reasoning 标记（24h 缓存，网络不通自动跳过）
+- **账号池 failover**：多 key 加权轮询；`429` 尊重 `Retry-After` 退避重试（长限流自动隔离、指数退避），`401/403/402` 永久禁用并切换，`5xx/过载` 退避后自动重试（最多 3 次）
 - **请求拦截轮换**：fetch 补丁自动识别池子 key，出错时透明切换下一个 key，并把激活 key 写入 `auth.json`；支持 `fetch(url, init)` 与 `fetch(new Request(...))` 两种调用形式
 - **流式零缓冲**：2xx 响应原样直通，不 clone 不缓冲 —— SSE 流式输出零延迟
 - **安全落盘**：`.env` / `auth.json` 写入即 `chmod 0600`，共享状态文件中的 key 已脱敏
@@ -152,7 +152,7 @@ MYRELAY_BASE_URL="https://relay.example.com/v1"
 | `endpoint` | string | `/v1/models` | 模型列表端点 |
 | `timeoutMs` | number | `3000` | 发现请求超时 |
 | `smartModelName` | boolean | `false` | 用 `owned_by + id` 生成显示名 |
-| `filterNonChat` | boolean | `true` | 过滤非聊天模型（image/tts/embedding 等） |
+| `filterNonChat` | boolean | `true` | 过滤非聊天模型（当前仅自动剔除 embedding 类；image/audio/tts 等保留） |
 | `includeRegex` / `excludeRegex` | string[] | `[]` | 模型 ID 正则过滤 |
 | `models.includeBy` / `models.excludeBy` | {field, match\|equals}[] | `[]` | 模型字段级过滤 |
 | `cache.enabled` | boolean | `false` | 开启发现结果缓存 |
@@ -206,12 +206,13 @@ MYRELAY_BASE_URL="https://relay.example.com/v1"
 
 ```
 启动 → 解析 provider.relayPool / options.apiKeys 配置 → KeyPool 注册多 key
-     → config hook: 请求 {baseURL}/v1/models → 过滤 → 注入 config.provider.<id>.models
+     → config hook: 请求 {baseURL}/v1/models → 过滤 → models.dev 补 limit/reasoning
+                   → 注入 config.provider.<id>.models
      → fetch 补丁: 识别请求携带的池子 key 后进入轮换逻辑
        ├─ 2xx → 原样直通（不 clone、不缓冲，SSE 流式输出零延迟）
-       ├─ 401/403/402 → 禁用该 key, 切换下一个, 写入 auth.json
-       ├─ 429 → Retry-After ≥ 10s 隔离(指数退避)；< 10s 直接切换
-       ├─ 5xx/overload → 切换重试（最多 3 次）
+       ├─ 401/403/402 → 禁用该 key, 切换下一个, 写入 auth.json（无需等待）
+       ├─ 429/5xx/overload → 按 Retry-After（无则 2s）退避等待后重试
+       │     Retry-After ≥ 10s → 隔离该 key（指数退避 60s→300s）并切换
        └─ 全部 key 不可用 → 降级用当前 key，请求绝不抛异常
      错误响应 body 仅读取前 2KB 用于分类，不影响原响应
      兼容 fetch(url, init) 与 fetch(new Request(...)) 两种调用形式
@@ -238,6 +239,14 @@ MYRELAY_BASE_URL="https://relay.example.com/v1"
 **流式输出很卡 / 半天才出第一个字？**
 
 这是旧版本 `clone().text()` 缓冲整个响应导致的，升级到含 fetch 补丁修复的版本即可（2xx 响应现在零缓冲直通）。
+
+**401/403 报错但 key 没被禁用？**
+
+这是旧版本的已知 bug：错误分类器在检查 HTTP 状态码之前先做响应体关键字匹配，`quota`/`capacity`/`exhausted` 等字样会把 401/403 误判成"服务器过载"，导致坏 key 永不剔除、一直轮换重试。升级到最新版（`classify` 先判状态码再判关键字）即可。
+
+**429 之后请求为什么反而变慢了？**
+
+这是有意的：旧的实现收到 429 后不等待就直接换 key 重试，等于对中转站连续开火，只会招致更狠的限流；现在会尊重 `Retry-After`（没有则默认 2s 退避，上限 9s）再重试。长限流（≥10s）则把该 key 隔离起来，用其它 key 继续。
 
 **key 会明文暴露吗？**
 
