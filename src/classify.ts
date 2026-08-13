@@ -34,21 +34,30 @@ export function classify(raw: unknown): ClassifierResult {
     retryAfterMs = parseBodyRetryAfter(message) ?? parseBodyRetryAfter(body)
   }
 
-  if (hasOverloadPattern(body, message)) {
-    return { action: ErrorAction.Overload, retryAfterMs: retryAfterMs ?? 2000, reason: `Server overload — pattern: ${detectOverloadPattern(body, message)}` }
+  // 认证/账户类错误优先：无论响应体里写了什么（中转站常见 "quota"/"capacity" 等字眼），
+  // 401/402/403 都是 key 本身的问题，必须禁用该 key，而不是当成服务器过载去换 key 重试。
+  if (status === 401 || status === 403 || status === 402) {
+    const label = status === 402 ? "Payment required" : status === 401 ? "Authentication failed" : "Forbidden"
+    return { action: ErrorAction.Disable, retryAfterMs: null, reason: `${label} — HTTP ${status}` }
   }
 
   if (status === 429) {
     return { action: ErrorAction.Rotate, retryAfterMs, reason: "Rate limited — HTTP 429" }
   }
 
-  if (status === 401 || status === 403 || status === 402) {
-    const label = status === 402 ? "Payment required" : status === 401 ? "Authentication failed" : "Forbidden"
-    return { action: ErrorAction.Disable, retryAfterMs: null, reason: `${label} — HTTP ${status}` }
+  if (status >= 500 && status < 600) {
+    if (hasOverloadPattern(body, message)) {
+      return {
+        action: ErrorAction.Overload,
+        retryAfterMs: retryAfterMs ?? 2000,
+        reason: `Server overload — pattern: ${detectOverloadPattern(body, message)}`,
+      }
+    }
+    return { action: ErrorAction.Rotate, retryAfterMs: null, reason: `Server error — HTTP ${status}` }
   }
 
-  if (status >= 500 && status < 600) {
-    return { action: ErrorAction.Rotate, retryAfterMs: null, reason: `Server error — HTTP ${status}` }
+  if (hasOverloadPattern(body, message)) {
+    return { action: ErrorAction.Overload, retryAfterMs: retryAfterMs ?? 2000, reason: `Server overload — pattern: ${detectOverloadPattern(body, message)}` }
   }
 
   if (hasRateLimitPattern(body, message)) {
@@ -93,18 +102,17 @@ function parseBodyRetryAfter(text: string): number | null {
 
 function detectOverloadPattern(body: string, message: string): string | null {
   const lower = body.toLowerCase() + message.toLowerCase()
+  // 只匹配明确的过载描述。不要用 "capacity"/"quota"/"exhausted" 等宽泛词——
+  // 中转站常见 "quota exceeded"（余额/配额）会被误判为过载。
   const patterns = [
+    "server is overloaded",
+    "server overloaded",
+    "overloaded",
+    "worker local total request limit",
     "resource exhausted",
     "resource_exhausted",
     "res_exhausted",
     "res exhausted",
-    "exhausted",
-    "worker local total request limit",
-    "server is overloaded",
-    "overloaded",
-    "service unavailable",
-    "capacity",
-    "quota",
   ]
   for (const p of patterns) {
     if (lower.includes(p)) return `"${p}"`
