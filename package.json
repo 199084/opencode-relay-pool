@@ -1,0 +1,53 @@
+{
+  "name": "opencode-relay-pool",
+  "version": "0.2.0",
+  "description": "OpenCode plugin: dynamic model discovery for OpenAI-compatible relay/gateway endpoints + multi-key failover account pool with auto rotation, quarantine and weighted round-robin",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/199084/opencode-relay-pool.git"
+  },
+  "homepage": "https://github.com/199084/opencode-relay-pool#readme",
+  "bugs": {
+    "url": "https://github.com/199084/opencode-relay-pool/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "relay",
+    "proxy",
+    "gateway",
+    "model-discovery",
+    "failover",
+    "account-pool",
+    "key-rotation",
+    "openai-compatible",
+    "llm"
+  ],
+  "exports": {
+    "./server": {
+      "import": "./src/index.ts",
+      "config": {}
+    }
+  },
+  "main": "./src/index.ts",
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
+  "engines": {
+    "opencode": ">=1.4.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.0.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.11",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}
