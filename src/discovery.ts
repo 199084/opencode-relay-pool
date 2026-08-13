@@ -142,11 +142,11 @@ export type ModelType = "chat" | "embedding" | "unknown"
 export function categorizeModel(id: string): ModelType {
   const lower = id.toLowerCase()
   if (/embed|text-embedding|embedding-/.test(lower)) return "embedding"
+  // image/audio/video/rerank 模型不硬过滤——它们也可能被当作 chat 使用
+  // (如 gpt-image 有文本输出、reranker 有输入文本)。embedding 是唯一明确
+  // 不可用于 chat 的类型。其余一律视为 chat 保留。
   if (/(^|[-_:/])chat[-_/]?|gpt-|claude|gemini|deepseek|qwen|llama|glm|kimi|moonshot|mistral|command|o1|o3|o4|grok|doubao|ernie|hunyuan|minimax|step-|spark|abab|yi-|phi|granite|internlm/.test(lower)) {
     return "chat"
-  }
-  if (/image|dall-e|stable-diffusion|flux|sora|tts|whisper|audio|rerank|reranker|moderation/.test(lower)) {
-    return "unknown"
   }
   return "chat"
 }
@@ -230,7 +230,13 @@ function writeJsonCache(filePath: string, data: Record<string, unknown>): void {
   }
 }
 
+// models.dev 失败冷却：网络不通时不要每次刷新都干等超时(10s)。
+// 失败后 5 分钟内直接返回空结果。
+const MODELS_DEV_FAIL_COOLDOWN_MS = 5 * 60 * 1000
+let modelsDevLastFailAt = 0
+
 export async function fetchModelsDevData(): Promise<Map<string, unknown>> {
+  if (Date.now() - modelsDevLastFailAt < MODELS_DEV_FAIL_COOLDOWN_MS) return new Map()
   const cachePath = path.join(dataDir(), MODELS_DEV_CACHE_FILE)
   const cached = readJsonCache(cachePath, MODELS_DEV_TTL_MS)
   if (cached) {
@@ -249,6 +255,7 @@ export async function fetchModelsDevData(): Promise<Map<string, unknown>> {
   } catch {
     // fall through
   }
+  modelsDevLastFailAt = Date.now()
   if (cached) return new Map(Object.entries(cached))
   return new Map()
 }
@@ -315,6 +322,11 @@ export async function discoverForProvider(
   const smartName = cfg.smartModelName === true
   const filterNonChat = cfg.filterNonChat !== false
 
+  // models.dev 元数据(24h 缓存,失败静默降级)用于给新发现的模型补
+  // context 上限 / reasoning 标记,否则 opencode 会套用默认上下文窗口,
+  // 大上下文模型会被错误截断。
+  const modelsDev = await fetchModelsDevData()
+
   const discovered: Record<string, Record<string, unknown>> = {}
   for (const model of result.models) {
     if (!model.id) continue
@@ -336,6 +348,19 @@ export async function discoverForProvider(
       entry.modalities = { input: ["text"], output: ["text"] }
     }
     if (typeof model.owned_by === "string" && model.owned_by) entry.ownedBy = model.owned_by
+
+    const dev = modelsDev.get(model.id)
+    if (dev && typeof dev === "object") {
+      const info = dev as {
+        reasoning?: boolean
+        limit?: { context?: number }
+        modalities?: { input?: string[]; output?: string[] }
+      }
+      if (typeof info.limit?.context === "number" && info.limit.context > 0) {
+        entry.limit = { ...((entry.limit as object) ?? {}), context: info.limit.context }
+      }
+      if (info.reasoning === true) entry.reasoning = true
+    }
     discovered[model.id] = entry
   }
 

@@ -186,41 +186,55 @@ export function installFetchPatch(
       if (attempt >= MAX_RETRIES - 1) return res
 
       const masked = maskKey(key)
-      const next = safePick(providerID, key)
-      if (next === key) continue
 
+      // 401/402/403: the key itself is invalid — disable it and move to the
+      // next key immediately (no wait needed; retrying the same key is futile).
       if (result.action === ErrorAction.Disable) {
         _pool.disable(providerID, key, result.reason)
-        try {
-          writeAuthKey(providerID, next)
-        } catch {
-          // ignore
+        const next = safePick(providerID, key)
+        if (next !== key) {
+          try {
+            writeAuthKey(providerID, next)
+          } catch {
+            // ignore
+          }
         }
         _toast?.(`${providerID} key ${masked} disabled — ${result.reason}`, "error")
         key = next
         continue
       }
 
-      const delay = result.retryAfterMs ?? 2000
-      if (delay >= 10_000) {
-        _pool.quarantine(providerID, key, delay, result.reason)
-        try {
-          writeAuthKey(providerID, next)
-        } catch {
-          // ignore
+      // Long rate-limit windows: quarantine the key and switch to the next one.
+      if (result.retryAfterMs !== null && result.retryAfterMs >= 10_000) {
+        _pool.quarantine(providerID, key, result.retryAfterMs, result.reason)
+        const next = safePick(providerID, key)
+        if (next !== key) {
+          try {
+            writeAuthKey(providerID, next)
+          } catch {
+            // ignore
+          }
         }
         _toast?.(
-          `[${providerID}] key ${masked} quarantined → ${maskKey(next)} (${Math.ceil(delay / 1000)}s)`,
+          `[${providerID}] key ${masked} quarantined → ${maskKey(next)} (${Math.ceil(result.retryAfterMs / 1000)}s)`,
           "warning",
         )
         key = next
         continue
       }
 
-      try {
-        writeAuthKey(providerID, next)
-      } catch {
-        // ignore
+      // Short delay (or no explicit retry-after): respect the server's hint —
+      // or use a sane backoff — before retrying. Never hammer the relay
+      // immediately after a 429/overload, even when there is only one key.
+      const delay = Math.min(result.retryAfterMs ?? 2000, 9000)
+      await sleep(delay)
+      const next = safePick(providerID, key)
+      if (next !== key) {
+        try {
+          writeAuthKey(providerID, next)
+        } catch {
+          // ignore
+        }
       }
       _toast?.(
         `[${providerID}] → ${maskKey(next)} (${Math.ceil(delay / 1000)}s)`,
@@ -231,6 +245,10 @@ export function installFetchPatch(
 
     throw new Error("opencode-relay-pool: retry loop exhausted")
   }) as typeof fetch
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 export function uninstallFetchPatch(): void {
