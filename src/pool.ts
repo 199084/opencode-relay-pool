@@ -7,6 +7,7 @@ const QUARANTINE_CAP_MS = 300_000
 export class KeyPool {
   private pools = new Map<string, KeyState[]>()
   private indexes = new Map<string, number>()
+  private baseURLs = new Map<string, string>()
 
   private serialize(): void {
     const providers: SharedProviderState[] = []
@@ -25,7 +26,7 @@ export class KeyPool {
       providers.push({
         id: providerID,
         name: displayProviderName(providerID),
-        baseURL: "",
+        baseURL: this.baseURLs.get(providerID) ?? "",
         keys: sharedKeys,
       })
     }
@@ -33,6 +34,7 @@ export class KeyPool {
   }
 
   register(provider: RelayProvider): void {
+    if (provider.baseURL) this.baseURLs.set(provider.id, provider.baseURL)
     const previous = this.pools.get(provider.id) ?? []
     const previousByKey = new Map(previous.map((entry) => [entry.key, entry]))
     this.pools.set(

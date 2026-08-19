@@ -4,6 +4,7 @@ import { test, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
 import { createServer, type Server } from "node:http"
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
+import { mkdirSync, rmSync } from "node:fs"
 import { server } from "../src/index.ts"
 import { authFilePath } from "../src/shared.ts"
 
@@ -411,6 +412,31 @@ test("E2E: 429 with retry-after-ms waits then retries the next key", async () =>
   } finally {
     await hooks.dispose!()
     limited.close()
+  }
+})
+
+test("E2E: external provider (auth/env only, not in config) gets model discovery on config hook", async () => {
+  const port = await startMockRelay()
+  const m = mockClient()
+  const hooks = await server(m.input)
+  const envPath = "/tmp/opencode/relay-pool-e2e/.env"
+  mkdirSync("/tmp/opencode/relay-pool-e2e", { recursive: true })
+  const envContent = [
+    `MYRELAY_API_KEYS=sk-test`,
+    `MYRELAY_BASE_URL=http://127.0.0.1:${port}/v1`,
+  ].join("\n")
+  writeFileSync(envPath, envContent, "utf-8")
+  try {
+    const config: any = { provider: {} }
+    await hooks.config!(config)
+    assert.ok(config.provider.myrelay, "external provider entry must be created in live config")
+    assert.ok(config.provider.myrelay.models["gpt-5.2"], "discovered models must be injected for external provider")
+    assert.ok(config.provider.myrelay.models["deepseek-chat"])
+    assert.equal(relayHits.some((h) => h.url === "/v1/models" && h.auth === "Bearer sk-test"), true)
+  } finally {
+    await hooks.dispose!()
+    relay.close()
+    rmSync(envPath, { force: true })
   }
 })
 

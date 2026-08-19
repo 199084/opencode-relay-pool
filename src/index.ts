@@ -61,8 +61,13 @@ export const server: Plugin = async (input: PluginInput, opts?: Options) => {
   ): void => {
     discoveredCounts.set(providerID, Object.keys(discovered).length)
     if (!liveConfig?.provider || typeof liveConfig.provider !== "object") return
-    const p = liveConfig.provider[providerID]
-    if (!p || typeof p !== "object") return
+    const provider = providerMap.get(providerID)
+    let p = liveConfig.provider[providerID]
+    if (!p || typeof p !== "object") {
+      if (!provider) return
+      p = { npm: "@ai-sdk/openai-compatible", name: provider.name ?? providerID }
+      liveConfig.provider[providerID] = p
+    }
     const preserved = userModels.get(providerID) ?? {}
     p.models = { ...discovered, ...preserved }
   }
@@ -126,16 +131,18 @@ export const server: Plugin = async (input: PluginInput, opts?: Options) => {
 
       if (config && config.provider && typeof config.provider === "object") {
         const discoveryJobs: Promise<void>[] = []
-        for (const provider of collected.providers.values()) {
+        const discoveryProviders = [...collected.providers.values(), ...collected.external.values()]
+        for (const provider of discoveryProviders) {
           if (provider.baseURL.length === 0) continue
           const p = config.provider[provider.id]
-          if (!p || typeof p !== "object") continue
-
-          const relayCfg = p.options?.relayPool ?? p.options?.modelsDiscovery
+          const relayCfg =
+            p && typeof p === "object" ? p.options?.relayPool ?? p.options?.modelsDiscovery : undefined
           if (relayCfg?.enabled === false) continue
 
           if (!userModels.has(provider.id)) {
-            const existing = p.models && typeof p.models === "object" ? { ...p.models } : {}
+            const existing = p && typeof p === "object" && p.models && typeof p.models === "object"
+              ? { ...p.models }
+              : {}
             userModels.set(provider.id, existing)
           }
 
